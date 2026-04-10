@@ -1,0 +1,10 @@
+log_level: "info"
+port: 8080
+debug: false
+server:
+  host: "0.0.0.0"
+  read_timeout: 30
+  write_timeout: 30
+metrics:
+  enabled: true
+  endpoint: "/metrics"
