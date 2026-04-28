@@ -29,12 +29,68 @@ func rapidTempDir(t *rapid.T) string {
 	return dir
 }
 
-// =============================================================================
-// INVARIANT CHECKERS
-//
-// These encode the properties that MUST hold across every possible "universe"
-// of saucegen inputs. If any of these fail, we have a real bug.
-// =============================================================================
+func cleanupDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0755); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore permissions for %s: %v", dir, err)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove %s: %v", dir, err)
+		}
+	})
+}
+
+func mustChmod(t *testing.T, dir string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(dir, mode); err != nil {
+		t.Fatalf("chmod %s: %v", dir, err)
+	}
+}
+
+func saveGeneratedFiles(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read generated dir: %v", err)
+	}
+
+	files := make(map[string][]byte, len(entries))
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		files[entry.Name()] = data
+	}
+	return files
+}
+
+func clearGeneratedFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read generated dir: %v", err)
+	}
+	for _, entry := range entries {
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+			t.Fatalf("remove %s: %v", entry.Name(), err)
+		}
+	}
+}
+
+func restoreGeneratedFiles(t *testing.T, dir string, files map[string][]byte, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		data, ok := files[name]
+		if !ok {
+			t.Fatalf("saved output missing %s", name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0644); err != nil {
+			t.Fatalf("restore %s: %v", name, err)
+		}
+	}
+}
 
 // invariantResult captures a single invariant check outcome.
 type invariantResult struct {
@@ -69,8 +125,6 @@ func checkAllInvariants(outDir string, fields []FieldInfo, cfg Config) []invaria
 	}
 	return violations
 }
-
-// --- individual invariant implementations ---
 
 func invAllYAMLValid(outDir string, _ []FieldInfo, _ Config) *invariantResult {
 	entries, err := os.ReadDir(outDir)
@@ -142,9 +196,15 @@ func invKustomizationCorrect(outDir string, _ []FieldInfo, _ Config) *invariantR
 	if err := yaml.Unmarshal(data, &k); err != nil {
 		return &invariantResult{"KustomizationMatchesFiles", false, fmt.Sprintf("unmarshal: %v", err)}
 	}
-	resources, _ := k["resources"].([]interface{})
+	resources, ok := k["resources"].([]interface{})
+	if !ok {
+		return &invariantResult{"KustomizationMatchesFiles", false, "resources is not a list"}
+	}
 	for _, r := range resources {
-		name, _ := r.(string)
+		name, ok := r.(string)
+		if !ok {
+			return &invariantResult{"KustomizationMatchesFiles", false, "resource entry is not a string"}
+		}
 		if !fileExists(filepath.Join(outDir, name)) {
 			return &invariantResult{"KustomizationMatchesFiles", false,
 				fmt.Sprintf("kustomization lists %s but file does not exist", name)}
@@ -198,12 +258,21 @@ func invNoPublicLeakToES(outDir string, fields []FieldInfo, cfg Config) *invaria
 	if err := yaml.Unmarshal(data, &es); err != nil {
 		return nil
 	}
-	spec, _ := es["spec"].(map[string]interface{})
-	esData, _ := spec["data"].([]interface{})
+	spec, ok := es["spec"].(map[string]interface{})
+	if !ok {
+		return &invariantResult{"NoPublicInExternalSecretUnlessConfigAsSecret", false, "spec is not a map"}
+	}
+	esData, ok := spec["data"].([]interface{})
+	if !ok {
+		return &invariantResult{"NoPublicInExternalSecretUnlessConfigAsSecret", false, "spec.data is not a list"}
+	}
 
 	esKeys := map[string]bool{}
 	for _, d := range esData {
-		entry, _ := d.(map[string]interface{})
+		entry, ok := d.(map[string]interface{})
+		if !ok {
+			return &invariantResult{"NoPublicInExternalSecretUnlessConfigAsSecret", false, "data entry is not a map"}
+		}
 		if sk, ok := entry["secretKey"].(string); ok {
 			esKeys[sk] = true
 		}
@@ -281,13 +350,6 @@ func invFieldCounts(outDir string, fields []FieldInfo, _ Config) *invariantResul
 	return nil
 }
 
-// =============================================================================
-// GENERATORS
-//
-// These produce random "universes" — arbitrary struct shapes, field lists, and
-// config combinations that real adopters might throw at saucegen.
-// =============================================================================
-
 // genFieldName produces random valid field names (lowercase, underscore-separated).
 func genFieldName(t *rapid.T) string {
 	parts := rapid.SliceOfN(
@@ -352,8 +414,7 @@ func genFieldInfoSlice(t *rapid.T) []FieldInfo {
 	return fields
 }
 
-// genConfig produces a random Config (without PackagePath/ValuesFile since those
-// need real files — this generator is for writeManifests-level testing).
+// genConfig produces a random Config for writeManifests-level testing.
 func genConfig(t *rapid.T, outDir string) Config {
 	return Config{
 		AppName: rapid.StringMatching(`[a-z]{3,10}(-[a-z]{3,10})?`).Draw(t, "app_name"),
@@ -368,9 +429,7 @@ func genConfig(t *rapid.T, outDir string) Config {
 	}
 }
 
-// genTypesStruct builds a random *types.Struct with valid mapstructure/sauce tags
-// for direct walkStruct testing. This is the most powerful generator — it creates
-// struct shapes that no human would write.
+// genTypesStruct builds a random *types.Struct with valid mapstructure and sauce tags.
 func genTypesStruct(t *rapid.T) (*types.Struct, []expectedField) {
 	numFields := rapid.IntRange(1, 15).Draw(t, "num_struct_fields")
 	vars := make([]*types.Var, numFields)
@@ -418,16 +477,8 @@ type expectedField struct {
 	isSecret bool
 }
 
-// =============================================================================
-// PROPERTY TESTS
-//
-// These are the actual DST simulations. Each one generates thousands of random
-// universes and checks that all invariants hold. A failure reports the seed for
-// perfect reproducibility.
-// =============================================================================
-
 // TestDST_WriteManifests_AllInvariantsHold generates random fields + configs
-// and verifies every invariant holds across thousands of universes.
+// and verifies every invariant.
 func TestDST_WriteManifests_AllInvariantsHold(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		outDir := rapidTempDir(t)
@@ -750,7 +801,6 @@ func TestDST_FullPipeline_FixtureWithRandomConfig(t *testing.T) {
 			t.Fatalf("Generate(%s) failed: %v", structName, err)
 		}
 
-		// Re-derive fields from the output schema to check invariants.
 		schemaData, err := os.ReadFile(filepath.Join(outDir, "schema.yaml"))
 		if err != nil {
 			t.Fatalf("read schema: %v", err)
@@ -777,131 +827,84 @@ func TestDST_FullPipeline_FixtureWithRandomConfig(t *testing.T) {
 	})
 }
 
-// =============================================================================
-// ERROR PATH DST
-//
-// These tests verify that Generate and writeManifests fail cleanly and
-// predictably under adversarial inputs, covering all defensive branches.
-// =============================================================================
+// TestDST_Generate_ErrorCases verifies Generate fails for invalid inputs.
+func TestDST_Generate_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         Config
+		errContains string
+	}{
+		{
+			name: "target name exists but is not a struct",
+			cfg: Config{
+				PackagePath: "./testdata/fixture",
+				StructName:  "NotAStruct",
+			},
+			errContains: "not a struct",
+		},
+		{
+			name: "target struct does not exist",
+			cfg: Config{
+				PackagePath: "./testdata/fixture",
+				StructName:  "MissingConfig",
+			},
+			errContains: "not found",
+		},
+		{
+			name: "values file path does not exist",
+			cfg: Config{
+				PackagePath: "./testdata/fixture",
+				StructName:  "AppConfig",
+				ValuesFile:  "/tmp/nonexistent_saucegen_values.yaml",
+			},
+			errContains: "values file",
+		},
+		{
+			name: "values file is invalid YAML",
+			cfg: Config{
+				PackagePath: "./testdata/fixture",
+				StructName:  "AppConfig",
+				ValuesFile:  "./testdata/fixture/invalid.yaml",
+			},
+			errContains: "unmarshal",
+		},
+		{
+			name: "package has compile errors",
+			cfg: Config{
+				PackagePath: "./testdata/broken",
+				StructName:  "Anything",
+			},
+		},
+		{
+			name: "package pattern is invalid",
+			cfg: Config{
+				PackagePath: "definitely_not_a_real_package_@#$%",
+				StructName:  "X",
+			},
+		},
+	}
 
-// TestDST_Generate_NotAStruct covers line 90: target name exists but is not a struct.
-func TestDST_Generate_NotAStruct(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		outDir := rapidTempDir(t)
-		g := NewGenerator(Config{
-			PackagePath:        "./testdata/fixture",
-			StructName:         "NotAStruct",
-			AppName:            rapid.StringMatching(`[a-z]{3,8}`).Draw(t, "app"),
-			Namespace:          "default",
-			SecretStore:        "vault",
-			OutputDir:          outDir,
-			SecretKeySeparator: "-",
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			cfg.AppName = "test"
+			cfg.Namespace = "default"
+			cfg.SecretStore = "vault"
+			cfg.OutputDir = t.TempDir()
+			cfg.SecretKeySeparator = "-"
+
+			err := NewGenerator(cfg).Generate()
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+				t.Errorf("expected %q in error, got: %s", tt.errContains, err)
+			}
 		})
-		err := g.Generate()
-		if err == nil {
-			t.Fatal("expected error for non-struct type, got nil")
-		}
-		if !strings.Contains(err.Error(), "not a struct") {
-			t.Errorf("expected 'not a struct' in error, got: %s", err)
-		}
-	})
+	}
 }
 
-// TestDST_Generate_MissingStruct covers line 84-85: struct name not found.
-func TestDST_Generate_MissingStruct(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		outDir := rapidTempDir(t)
-		fakeName := rapid.StringMatching(`[A-Z][a-z]{5,12}`).Draw(t, "fake_struct")
-		g := NewGenerator(Config{
-			PackagePath:        "./testdata/fixture",
-			StructName:         fakeName,
-			AppName:            "test",
-			Namespace:          "default",
-			SecretStore:        "vault",
-			OutputDir:          outDir,
-			SecretKeySeparator: "-",
-		})
-		err := g.Generate()
-		if err == nil {
-			t.Fatal("expected error for missing struct, got nil")
-		}
-		if !strings.Contains(err.Error(), "not found") {
-			t.Errorf("expected 'not found' in error, got: %s", err)
-		}
-	})
-}
-
-// TestDST_Generate_BadValuesFilePath covers line 97: values file does not exist.
-func TestDST_Generate_BadValuesFilePath(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		outDir := rapidTempDir(t)
-		fakePath := rapid.StringMatching(`/tmp/nonexistent_[a-z]{5,10}\.yaml`).Draw(t, "path")
-		g := NewGenerator(Config{
-			PackagePath:        "./testdata/fixture",
-			StructName:         "AppConfig",
-			AppName:            "test",
-			Namespace:          "default",
-			SecretStore:        "vault",
-			ValuesFile:         fakePath,
-			OutputDir:          outDir,
-			SecretKeySeparator: "-",
-		})
-		err := g.Generate()
-		if err == nil {
-			t.Fatal("expected error for bad values file path, got nil")
-		}
-		if !strings.Contains(err.Error(), "values file") {
-			t.Errorf("expected 'values file' in error, got: %s", err)
-		}
-	})
-}
-
-// TestDST_Generate_InvalidValuesYAML covers line 100: values file is not valid YAML.
-func TestDST_Generate_InvalidValuesYAML(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		outDir := rapidTempDir(t)
-		g := NewGenerator(Config{
-			PackagePath:        "./testdata/fixture",
-			StructName:         "AppConfig",
-			AppName:            "test",
-			Namespace:          "default",
-			SecretStore:        "vault",
-			ValuesFile:         "./testdata/fixture/invalid.yaml",
-			OutputDir:          outDir,
-			SecretKeySeparator: "-",
-		})
-		err := g.Generate()
-		if err == nil {
-			t.Fatal("expected error for invalid YAML, got nil")
-		}
-		if !strings.Contains(err.Error(), "unmarshal") {
-			t.Errorf("expected 'unmarshal' in error, got: %s", err)
-		}
-	})
-}
-
-// TestDST_Generate_PackageWithErrors covers line 80: package has compile errors.
-func TestDST_Generate_PackageWithErrors(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		outDir := rapidTempDir(t)
-		g := NewGenerator(Config{
-			PackagePath:        "./testdata/broken",
-			StructName:         "Anything",
-			AppName:            "test",
-			Namespace:          "default",
-			SecretStore:        "vault",
-			OutputDir:          outDir,
-			SecretKeySeparator: "-",
-		})
-		err := g.Generate()
-		if err == nil {
-			t.Fatal("expected error for broken package, got nil")
-		}
-	})
-}
-
-// TestDST_WriteManifests_UnwritableOutputDir covers error paths in writeManifests
-// and writeYAML when the output directory cannot be written to.
+// TestDST_WriteManifests_UnwritableOutputDir verifies unwritable output directories fail.
 func TestDST_WriteManifests_UnwritableOutputDir(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		fields := []FieldInfo{
@@ -921,9 +924,7 @@ func TestDST_WriteManifests_UnwritableOutputDir(t *testing.T) {
 	})
 }
 
-// TestDST_WriteManifests_ReadOnlyDir covers writeYAML error returns when the
-// directory exists but is not writable. This hits os.Create failure (line 373)
-// and all cascading error returns in writeManifests (lines 238, 287, 311, etc).
+// TestDST_WriteManifests_ReadOnlyDir verifies writeYAML errors when output cannot be written.
 func TestDST_WriteManifests_ReadOnlyDir(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -931,17 +932,17 @@ func TestDST_WriteManifests_ReadOnlyDir(t *testing.T) {
 		cas    bool
 	}{
 		{
-			name:   "secrets_path",
+			name:   "secret manifest cannot be written",
 			fields: []FieldInfo{{Path: "secret_key", Name: "secret_key", IsSecret: true}},
 			cas:    false,
 		},
 		{
-			name:   "config_as_secret_path",
+			name:   "config external secret cannot be written",
 			fields: []FieldInfo{{Path: "public_key", Name: "public_key", IsSecret: false, Value: "v"}},
 			cas:    true,
 		},
 		{
-			name:   "configmap_path",
+			name:   "config map cannot be written",
 			fields: []FieldInfo{{Path: "public_key", Name: "public_key", IsSecret: false, Value: "v"}},
 			cas:    false,
 		},
@@ -952,12 +953,9 @@ func TestDST_WriteManifests_ReadOnlyDir(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer os.RemoveAll(dir)
+			cleanupDir(t, dir)
 
-			if err := os.Chmod(dir, 0555); err != nil {
-				t.Fatal(err)
-			}
-			defer os.Chmod(dir, 0755)
+			mustChmod(t, dir, 0555)
 
 			g := NewGenerator(Config{
 				AppName:            "test",
@@ -976,12 +974,8 @@ func TestDST_WriteManifests_ReadOnlyDir(t *testing.T) {
 	}
 }
 
-// TestDST_WriteManifests_FailAfterFirstWrite covers the later writeYAML error
-// returns (kustomization, schema, defaults, bootstrap) that are only reachable
-// when earlier writes succeed. We let the first write go through, then chmod.
+// TestDST_WriteManifests_FailAfterFirstWrite verifies later writeYAML errors.
 func TestDST_WriteManifests_FailAfterFirstWrite(t *testing.T) {
-	// This test covers lines 320-321, 338-339, 347-348, 361-362.
-	// We use both secrets + public fields so multiple writes happen in sequence.
 	fields := []FieldInfo{
 		{Path: "secret_a", Name: "secret_a", IsSecret: true},
 		{Path: "pub_b", Name: "pub_b", IsSecret: false, Value: "val"},
@@ -991,10 +985,7 @@ func TestDST_WriteManifests_FailAfterFirstWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		os.Chmod(dir, 0755)
-		os.RemoveAll(dir)
-	}()
+	cleanupDir(t, dir)
 
 	g := NewGenerator(Config{
 		AppName:            "test",
@@ -1004,48 +995,26 @@ func TestDST_WriteManifests_FailAfterFirstWrite(t *testing.T) {
 		SecretKeySeparator: "-",
 	})
 
-	// First, run normally to confirm it works.
 	if err := g.writeManifests(fields); err != nil {
 		t.Fatalf("writeManifests baseline: %v", err)
 	}
 
-	// Now remove all generated files, make dir read-only, and re-place only
-	// the files that are written BEFORE the target error return.
-	// Strategy: save output, clear, chmod, restore files one-by-one to
-	// let later writes fail.
-	savedFiles := map[string][]byte{}
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		savedFiles[e.Name()] = data
-	}
-
-	// Test: let external-secret-secrets.yaml + config-map.yaml succeed,
-	// then fail on kustomization.yaml.
-	os.Chmod(dir, 0755)
-	for _, e := range entries {
-		os.Remove(filepath.Join(dir, e.Name()))
-	}
-	// Write the ES and CM files so those writes are "already done".
-	for _, f := range []string{"external-secret-secrets.yaml", "config-map.yaml"} {
-		if data, ok := savedFiles[f]; ok {
-			os.WriteFile(filepath.Join(dir, f), data, 0644)
-		}
-	}
-	os.Chmod(dir, 0555)
+	savedFiles := saveGeneratedFiles(t, dir)
+	mustChmod(t, dir, 0755)
+	clearGeneratedFiles(t, dir)
+	restoreGeneratedFiles(t, dir, savedFiles, "external-secret-secrets.yaml", "config-map.yaml")
+	mustChmod(t, dir, 0555)
 	err = g.writeManifests(fields)
-	os.Chmod(dir, 0755)
+	mustChmod(t, dir, 0755)
 	if err == nil {
 		t.Error("expected error when kustomization.yaml write fails")
 	}
 }
 
-// TestDST_RunGenerate covers runGenerate from main.go — it's callable since we're
-// in the same package. This covers the function that Cobra invokes.
+// TestDST_RunGenerate verifies runGenerate creates generator output.
 func TestDST_RunGenerate(t *testing.T) {
 	outDir := t.TempDir()
 
-	// Set the package-level vars that Cobra normally populates.
 	structName = "AppConfig"
 	name = "testapp"
 	namespace = "default"
@@ -1061,13 +1030,12 @@ func TestDST_RunGenerate(t *testing.T) {
 		t.Fatalf("runGenerate failed: %v", err)
 	}
 
-	// Verify output was created.
 	if !fileExists(filepath.Join(outDir, "schema.yaml")) {
 		t.Error("expected schema.yaml to be created")
 	}
 }
 
-// TestDST_RunGenerate_Error covers runGenerate error propagation.
+// TestDST_RunGenerate_Error verifies runGenerate returns generation errors.
 func TestDST_RunGenerate_Error(t *testing.T) {
 	outDir := t.TempDir()
 	structName = "NonExistent"
@@ -1086,172 +1054,60 @@ func TestDST_RunGenerate_Error(t *testing.T) {
 	}
 }
 
-// TestDST_Generate_PackagesLoadError covers line 71: packages.Load returns an error.
-// Using a pattern with "..." that resolves to nothing valid can trigger this.
-func TestDST_Generate_PackagesLoadError(t *testing.T) {
-	outDir := t.TempDir()
-	g := NewGenerator(Config{
-		PackagePath:        "definitely_not_a_real_package_@#$%",
-		StructName:         "X",
-		AppName:            "test",
-		Namespace:          "default",
-		SecretStore:        "vault",
-		OutputDir:          outDir,
-		SecretKeySeparator: "-",
-	})
-	err := g.Generate()
-	if err == nil {
-		t.Fatal("expected error for invalid package pattern, got nil")
+// TestDST_WriteManifests_FailsAfterIntermediateOutputs verifies late write errors.
+func TestDST_WriteManifests_FailsAfterIntermediateOutputs(t *testing.T) {
+	tests := []struct {
+		name         string
+		restoreFiles []string
+	}{
+		{
+			name:         "schema cannot be written after config and kustomization exist",
+			restoreFiles: []string{"config-map.yaml", "kustomization.yaml"},
+		},
+		{
+			name:         "bootstrap cannot be written after schema exists",
+			restoreFiles: []string{"config-map.yaml", "kustomization.yaml", "schema.yaml"},
+		},
+		{
+			name:         "defaults cannot be written after bootstrap exists",
+			restoreFiles: []string{"config-map.yaml", "kustomization.yaml", "schema.yaml", "bootstrap.json"},
+		},
 	}
-}
-
-// TestDST_WriteManifests_FailOnSchemaWrite targets the schema.yaml error return
-// by letting earlier writes succeed.
-func TestDST_WriteManifests_FailOnSchemaWrite(t *testing.T) {
 	fields := []FieldInfo{
 		{Path: "pub", Name: "pub", IsSecret: false, Value: "v"},
 	}
 
-	dir, err := os.MkdirTemp("", "dst-failschema-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		os.Chmod(dir, 0755)
-		os.RemoveAll(dir)
-	}()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "dst-fail-late-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanupDir(t, dir)
 
-	g := NewGenerator(Config{
-		AppName:            "test",
-		Namespace:          "default",
-		SecretStore:        "vault",
-		OutputDir:          dir,
-		SecretKeySeparator: "-",
-	})
+			g := NewGenerator(Config{
+				AppName:            "test",
+				Namespace:          "default",
+				SecretStore:        "vault",
+				OutputDir:          dir,
+				SecretKeySeparator: "-",
+			})
 
-	// Baseline succeeds.
-	if err := g.writeManifests(fields); err != nil {
-		t.Fatalf("baseline: %v", err)
-	}
+			if err := g.writeManifests(fields); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
 
-	// Now: remove files, pre-create config-map.yaml and kustomization.yaml,
-	// then make dir read-only so schema.yaml fails.
-	os.Chmod(dir, 0755)
-	entries, _ := os.ReadDir(dir)
-	saved := map[string][]byte{}
-	for _, e := range entries {
-		data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		saved[e.Name()] = data
-		os.Remove(filepath.Join(dir, e.Name()))
-	}
-	for _, f := range []string{"config-map.yaml", "kustomization.yaml"} {
-		if data, ok := saved[f]; ok {
-			os.WriteFile(filepath.Join(dir, f), data, 0644)
-		}
-	}
-	os.Chmod(dir, 0555)
-	err = g.writeManifests(fields)
-	os.Chmod(dir, 0755)
-	if err == nil {
-		t.Error("expected error on schema.yaml write")
-	}
-}
-
-// TestDST_WriteManifests_FailOnDefaultsWrite targets the defaults.yaml error return.
-func TestDST_WriteManifests_FailOnDefaultsWrite(t *testing.T) {
-	fields := []FieldInfo{
-		{Path: "pub", Name: "pub", IsSecret: false, Value: "v"},
-	}
-
-	dir, err := os.MkdirTemp("", "dst-faildefaults-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		os.Chmod(dir, 0755)
-		os.RemoveAll(dir)
-	}()
-
-	g := NewGenerator(Config{
-		AppName:            "test",
-		Namespace:          "default",
-		SecretStore:        "vault",
-		OutputDir:          dir,
-		SecretKeySeparator: "-",
-	})
-
-	if err := g.writeManifests(fields); err != nil {
-		t.Fatalf("baseline: %v", err)
-	}
-
-	// Pre-create all files except defaults.yaml, then make dir read-only.
-	os.Chmod(dir, 0755)
-	entries, _ := os.ReadDir(dir)
-	saved := map[string][]byte{}
-	for _, e := range entries {
-		data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		saved[e.Name()] = data
-		os.Remove(filepath.Join(dir, e.Name()))
-	}
-	for _, f := range []string{"config-map.yaml", "kustomization.yaml", "schema.yaml", "bootstrap.json"} {
-		if data, ok := saved[f]; ok {
-			os.WriteFile(filepath.Join(dir, f), data, 0644)
-		}
-	}
-	os.Chmod(dir, 0555)
-	err = g.writeManifests(fields)
-	os.Chmod(dir, 0755)
-	if err == nil {
-		t.Error("expected error on defaults.yaml write")
-	}
-}
-
-// TestDST_WriteManifests_FailOnBootstrapWrite targets the bootstrap.json error return.
-func TestDST_WriteManifests_FailOnBootstrapWrite(t *testing.T) {
-	fields := []FieldInfo{
-		{Path: "pub", Name: "pub", IsSecret: false, Value: "v"},
-	}
-
-	dir, err := os.MkdirTemp("", "dst-failbootstrap-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		os.Chmod(dir, 0755)
-		os.RemoveAll(dir)
-	}()
-
-	g := NewGenerator(Config{
-		AppName:            "test",
-		Namespace:          "default",
-		SecretStore:        "vault",
-		OutputDir:          dir,
-		SecretKeySeparator: "-",
-	})
-
-	if err := g.writeManifests(fields); err != nil {
-		t.Fatalf("baseline: %v", err)
-	}
-
-	// Pre-create config-map, kustomization, schema — but NOT bootstrap.json.
-	os.Chmod(dir, 0755)
-	entries, _ := os.ReadDir(dir)
-	saved := map[string][]byte{}
-	for _, e := range entries {
-		data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		saved[e.Name()] = data
-		os.Remove(filepath.Join(dir, e.Name()))
-	}
-	for _, f := range []string{"config-map.yaml", "kustomization.yaml", "schema.yaml"} {
-		if data, ok := saved[f]; ok {
-			os.WriteFile(filepath.Join(dir, f), data, 0644)
-		}
-	}
-	os.Chmod(dir, 0555)
-	err = g.writeManifests(fields)
-	os.Chmod(dir, 0755)
-	if err == nil {
-		t.Error("expected error on bootstrap.json write")
+			saved := saveGeneratedFiles(t, dir)
+			mustChmod(t, dir, 0755)
+			clearGeneratedFiles(t, dir)
+			restoreGeneratedFiles(t, dir, saved, tt.restoreFiles...)
+			mustChmod(t, dir, 0555)
+			err = g.writeManifests(fields)
+			mustChmod(t, dir, 0755)
+			if err == nil {
+				t.Fatal("expected write error, got nil")
+			}
+		})
 	}
 }
 
@@ -1304,7 +1160,6 @@ func TestDST_WalkStruct_SquashWithPrefix(t *testing.T) {
 
 		g := &Generator{}
 
-		// Without prefix: squashed leaf should be at top level.
 		fields := g.walkStruct(outerStruct, "", nil)
 		if len(fields) != 1 {
 			t.Fatalf("expected 1 field, got %d", len(fields))
@@ -1313,7 +1168,6 @@ func TestDST_WalkStruct_SquashWithPrefix(t *testing.T) {
 			t.Errorf("squash without prefix: path = %s, want %s", fields[0].Path, leafName)
 		}
 
-		// With prefix: squashed leaf should use the prefix, not gain an extra segment.
 		fields = g.walkStruct(outerStruct, "parent", nil)
 		if len(fields) != 1 {
 			t.Fatalf("expected 1 field, got %d", len(fields))
