@@ -1,4 +1,5 @@
+// Package fixture contains configuration types used by generator tests.
 package fixture
 
-// NotAStruct is a type alias — not a struct. Used to test the "not a struct" error path.
+// NotAStruct names a non-struct config target.
 type NotAStruct = string
